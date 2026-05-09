@@ -43,10 +43,12 @@ tc.setSize(1.1);
 tc.addEventListener('dragging-changed', (e) => { orbit.enabled = !e.value; });
 scene.add(tc);
 
-// --- Selection + highlight ---
-const selectables = [];
-let selected = null;
+// Proxy used to transform multiple selected objects together.
+const proxy = new THREE.Object3D();
+proxy.userData.kind = 'proxy';
+scene.add(proxy);
 
+// --- Highlight ---
 function clearHighlight(obj) {
   if (!obj) return;
   obj.traverse(o => {
@@ -59,19 +61,102 @@ function clearHighlight(obj) {
 function applyHighlight(obj) {
   if (!obj) return;
   obj.traverse(o => {
-    if (o.material && o.material.emissive) {
+    if (o.material && o.material.emissive && o.userData._origEmissive === undefined) {
       o.userData._origEmissive = o.material.emissive.getHex();
       o.material.emissive.setHex(0x224477);
     }
   });
 }
 
-function setSelected(obj) {
-  clearHighlight(selected);
-  selected = obj;
+// --- Selection ---
+const selectables = [];
+let selection = []; // array of selected objects (single OR multiple top-level)
+
+function isMultiSelect() { return selection.length > 1; }
+function selectionPrimary() { return selection[0] || null; }
+
+function isTopLevelInScene(obj) {
+  return obj.parent === scene;
+}
+
+// For multi-select, we operate on top-level scene objects (figureRoot or primitive).
+// If a body part is given, return its figureRoot. Otherwise walk up to a direct scene child.
+function topLevelOf(obj) {
+  let p = obj;
+  while (p) {
+    if (p.userData && p.userData.kind === 'figureRoot') return p;
+    if (p.parent === scene) return p;
+    p = p.parent;
+  }
+  return obj;
+}
+
+// Re-parent all proxy children back to scene preserving their world transforms.
+function unloadProxy() {
+  [...proxy.children].forEach(c => scene.attach(c));
+  proxy.position.set(0, 0, 0);
+  proxy.rotation.set(0, 0, 0);
+  proxy.scale.set(1, 1, 1);
+}
+
+function refreshTransformTarget() {
+  unloadProxy();
+  if (selection.length === 0) {
+    tc.detach();
+    return;
+  }
+  if (selection.length === 1) {
+    tc.attach(selection[0]);
+    return;
+  }
+  // Multi: place proxy at centroid, parent all selected under it, attach gizmo.
+  const centroid = new THREE.Vector3();
+  const wp = new THREE.Vector3();
+  selection.forEach(o => { o.getWorldPosition(wp); centroid.add(wp); });
+  centroid.divideScalar(selection.length);
+  proxy.position.copy(centroid);
+  proxy.updateMatrixWorld(true);
+  selection.forEach(o => proxy.attach(o));
+  tc.attach(proxy);
+}
+
+function clearSelection() {
+  selection.forEach(clearHighlight);
+  unloadProxy();
+  selection = [];
+  tc.detach();
+}
+
+function setSingleSelection(obj) {
+  clearSelection();
+  if (!obj) return;
+  selection = [obj];
   applyHighlight(obj);
-  if (obj) tc.attach(obj);
-  else tc.detach();
+  refreshTransformTarget();
+}
+
+function toggleInSelection(obj) {
+  // Multi-select operates on top-level objects.
+  const top = topLevelOf(obj);
+  if (!top) return;
+
+  // If existing selection has a body part (non-top-level), promote it to its figureRoot first.
+  if (selection.length === 1 && !isTopLevelInScene(selection[0])) {
+    const promoted = topLevelOf(selection[0]);
+    clearHighlight(selection[0]);
+    selection = [promoted];
+    applyHighlight(promoted);
+  }
+
+  const idx = selection.indexOf(top);
+  if (idx >= 0) {
+    selection.splice(idx, 1);
+    clearHighlight(top);
+  } else {
+    selection.push(top);
+    applyHighlight(top);
+  }
+  refreshTransformTarget();
 }
 
 function setMode(mode) {
@@ -79,6 +164,18 @@ function setMode(mode) {
   document.querySelectorAll('[data-mode]').forEach(b => {
     b.classList.toggle('active', b.dataset.mode === mode);
   });
+}
+
+// --- Undo ---
+const undoStack = [];
+const UNDO_LIMIT = 100;
+function pushUndo(fn) {
+  undoStack.push(fn);
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+function performUndo() {
+  const fn = undoStack.pop();
+  if (fn) fn();
 }
 
 // --- Mannequin ---
@@ -146,7 +243,6 @@ function makeMannequin() {
   makeLeg('L');
   makeLeg('R');
 
-  // Visible root handle (disc at feet) so the whole figure is selectable
   const handle = new THREE.Mesh(
     new THREE.CylinderGeometry(0.28, 0.28, 0.04, 24),
     new THREE.MeshStandardMaterial({ color: accentColor, roughness: 0.5 })
@@ -196,37 +292,48 @@ const POSES = {
 };
 
 function applyPoseToFigure(figureRoot, pose) {
-  // reset all joint rotations first
   figureRoot.traverse(o => {
     if (o.userData.partName) o.rotation.set(0, 0, 0);
   });
-  // apply
   figureRoot.traverse(o => {
     const p = pose[o.userData.partName];
     if (p) o.rotation.set(p[0] || 0, p[1] || 0, p[2] || 0);
   });
 }
 
-function getSelectedFigureRoot() {
-  let p = selected;
-  while (p) {
-    if (p.userData && p.userData.kind === 'figureRoot') return p;
-    p = p.parent;
-  }
-  return null;
+function getSelectedFigureRoots() {
+  const roots = new Set();
+  selection.forEach(o => {
+    let p = o;
+    while (p) {
+      if (p.userData && p.userData.kind === 'figureRoot') { roots.add(p); break; }
+      p = p.parent;
+    }
+  });
+  return [...roots];
 }
 
 function applyPoseSmart(poseName) {
   const pose = POSES[poseName] || {};
-  let target = getSelectedFigureRoot();
-  if (!target) {
-    // fall back to all figures
+  let targets = getSelectedFigureRoots();
+  if (targets.length === 0) {
     scene.children.forEach(c => {
-      if (c.userData && c.userData.kind === 'figureRoot') applyPoseToFigure(c, pose);
+      if (c.userData && c.userData.kind === 'figureRoot') targets.push(c);
     });
-  } else {
-    applyPoseToFigure(target, pose);
   }
+  if (targets.length === 0) return;
+
+  // Snapshot rotations for undo
+  const snap = [];
+  targets.forEach(fr => {
+    fr.traverse(o => {
+      if (o.userData.partName) snap.push({ obj: o, rot: o.rotation.clone() });
+    });
+  });
+  targets.forEach(fr => applyPoseToFigure(fr, pose));
+  pushUndo(() => {
+    snap.forEach(s => s.obj.rotation.copy(s.rot));
+  });
 }
 
 // --- Camera presets ---
@@ -268,7 +375,23 @@ function makePrimitive(kind) {
 
 function addObject(obj) {
   scene.add(obj);
-  setSelected(obj);
+  setSingleSelection(obj);
+  // Collect descendants registered in selectables for undo's re-add
+  const registered = [];
+  obj.traverse(o => { if (selectables.includes(o)) registered.push(o); });
+  pushUndo(() => {
+    if (selection.includes(obj)) {
+      const idx = selection.indexOf(obj);
+      selection.splice(idx, 1);
+      clearHighlight(obj);
+      refreshTransformTarget();
+    }
+    registered.forEach(o => {
+      const i = selectables.indexOf(o);
+      if (i >= 0) selectables.splice(i, 1);
+    });
+    scene.remove(obj);
+  });
 }
 
 // --- Picking ---
@@ -296,14 +419,79 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   raycaster.setFromCamera(pointer, camera);
   const hits = raycaster.intersectObjects(selectables, false);
   if (hits.length === 0) {
-    setSelected(null);
+    if (!(e.shiftKey || e.ctrlKey || e.metaKey)) clearSelection();
     return;
   }
-  const obj = hits[0].object;
-  if (obj.userData.kind === 'figureHandle') {
-    setSelected(obj.userData.figureRoot);
+  const hit = hits[0].object;
+  const target = hit.userData.kind === 'figureHandle' ? hit.userData.figureRoot : hit;
+
+  if (e.shiftKey || e.ctrlKey || e.metaKey) {
+    toggleInSelection(target);
   } else {
-    setSelected(obj);
+    setSingleSelection(target);
+  }
+});
+
+// --- TransformControls undo hooks ---
+let tcSnapshot = null;
+tc.addEventListener('mouseDown', () => {
+  const t = tc.object;
+  if (!t) return;
+  tcSnapshot = {
+    target: t,
+    pos: t.position.clone(),
+    rot: t.rotation.clone(),
+    scl: t.scale.clone(),
+    // For multi-select, the proxy is the target. Children's local transforms
+    // don't change during drag (only proxy does), so restoring proxy is enough,
+    // BUT the user will eventually deselect, which re-parents children to scene.
+    // We need to restore world transforms in that case; easiest is to also
+    // snapshot each selected child's world matrix.
+    multi: t === proxy ? selection.map(o => ({
+      obj: o,
+      worldMatrix: o.matrixWorld.clone(),
+    })) : null,
+  };
+});
+tc.addEventListener('mouseUp', () => {
+  const s = tcSnapshot;
+  tcSnapshot = null;
+  if (!s) return;
+  const changed = !s.pos.equals(s.target.position) ||
+                  !s.rot.equals(s.target.rotation) ||
+                  !s.scl.equals(s.target.scale);
+  if (!changed) return;
+
+  if (s.multi) {
+    // Capture current world matrices to redo... actually we only need to undo.
+    // Restore proxy if still in same selection state, else re-parent each obj
+    // back to its parent at saved world transform.
+    pushUndo(() => {
+      // If proxy is still the TC target and selection unchanged, just restore proxy transform
+      if (tc.object === proxy && proxy.children.length === s.multi.length &&
+          s.multi.every(m => m.obj.parent === proxy)) {
+        s.target.position.copy(s.pos);
+        s.target.rotation.copy(s.rot);
+        s.target.scale.copy(s.scl);
+        return;
+      }
+      // Otherwise restore each object's world matrix by setting it on its current parent
+      s.multi.forEach(m => {
+        const o = m.obj;
+        const parent = o.parent || scene;
+        parent.updateMatrixWorld(true);
+        const localFromWorld = new THREE.Matrix4()
+          .copy(parent.matrixWorld).invert()
+          .multiply(m.worldMatrix);
+        localFromWorld.decompose(o.position, o.quaternion, o.scale);
+      });
+    });
+  } else {
+    pushUndo(() => {
+      s.target.position.copy(s.pos);
+      s.target.rotation.copy(s.rot);
+      s.target.scale.copy(s.scl);
+    });
   }
 });
 
@@ -328,7 +516,6 @@ document.querySelectorAll('[data-cam]').forEach(btn => {
   btn.addEventListener('click', () => setCameraPreset(btn.dataset.cam));
 });
 
-// Snap toggle
 let snapEnabled = false;
 const snapBtn = document.getElementById('snapBtn');
 function setSnap(on) {
@@ -347,32 +534,71 @@ function setSnap(on) {
 snapBtn.addEventListener('click', () => setSnap(!snapEnabled));
 
 document.getElementById('parentBtn').addEventListener('click', () => {
-  if (!selected) return;
-  let p = selected.parent;
+  const cur = selectionPrimary();
+  if (!cur) return;
+  let p = cur.parent;
   while (p && p !== scene) {
-    if (p.userData.kind === 'figureRoot') { setSelected(p); return; }
+    if (p.userData.kind === 'figureRoot') { setSingleSelection(p); return; }
     p = p.parent;
   }
 });
 
 document.getElementById('deleteBtn').addEventListener('click', () => {
-  if (!selected) return;
-  let top = selected;
-  while (top.parent && top.parent !== scene) top = top.parent;
-  top.traverse(o => {
-    const i = selectables.indexOf(o);
-    if (i >= 0) selectables.splice(i, 1);
+  if (selection.length === 0) return;
+  // Determine top-level scene objects to remove
+  const tops = new Set();
+  selection.forEach(o => {
+    let t = o;
+    while (t.parent && t.parent !== scene && t.parent !== proxy) t = t.parent;
+    if (t.parent === proxy) {
+      // top-level was re-parented to proxy for multi-edit; the proxy holds it
+      tops.add(t);
+    } else if (t.parent === scene) {
+      tops.add(t);
+    }
   });
-  scene.remove(top);
-  setSelected(null);
+
+  // Snapshot for undo before mutating
+  const removed = [];
+  tops.forEach(top => {
+    const originalParent = top.parent; // proxy or scene
+    const worldMatrix = top.matrixWorld.clone();
+    const registered = [];
+    top.traverse(o => { if (selectables.includes(o)) registered.push(o); });
+    removed.push({ top, originalParent, worldMatrix, registered });
+  });
+
+  // Perform removal: unload proxy first (returns items to scene), then remove from scene
+  unloadProxy();
+  selection = [];
+  tc.detach();
+  removed.forEach(r => {
+    r.registered.forEach(o => {
+      const i = selectables.indexOf(o);
+      if (i >= 0) selectables.splice(i, 1);
+    });
+    clearHighlight(r.top);
+    if (r.top.parent) r.top.parent.remove(r.top);
+  });
+
+  pushUndo(() => {
+    removed.forEach(r => {
+      scene.add(r.top);
+      // Restore world transform
+      scene.updateMatrixWorld(true);
+      const local = new THREE.Matrix4().copy(scene.matrixWorld).invert().multiply(r.worldMatrix);
+      local.decompose(r.top.position, r.top.quaternion, r.top.scale);
+      r.registered.forEach(o => { if (!selectables.includes(o)) selectables.push(o); });
+    });
+  });
 });
 
-document.getElementById('deselectBtn').addEventListener('click', () => setSelected(null));
+document.getElementById('deselectBtn').addEventListener('click', () => clearSelection());
 
 document.getElementById('resetBtn').addEventListener('click', () => {
   if (!confirm('全部消してリセットします。よろしいですか?')) return;
-  setSelected(null);
-  const keep = new Set([grid, ground, tc, dir, fill]);
+  clearSelection();
+  const keep = new Set([grid, ground, tc, proxy, dir, fill]);
   const toRemove = [];
   scene.children.forEach(c => {
     if (c.isLight || keep.has(c)) return;
@@ -380,6 +606,7 @@ document.getElementById('resetBtn').addEventListener('click', () => {
   });
   toRemove.forEach(c => scene.remove(c));
   selectables.length = 0;
+  undoStack.length = 0;
   addObject(makeMannequin());
 });
 
@@ -389,23 +616,20 @@ document.getElementById('exportBtn').addEventListener('click', () => {
   renderer.getSize(orig);
   const origPR = renderer.getPixelRatio();
 
-  // Hide gizmo + highlight for clean shot
   const wasVisible = tc.visible;
   tc.visible = false;
-  const heldSel = selected;
-  clearHighlight(heldSel);
+  const heldHL = [...selection];
+  heldHL.forEach(clearHighlight);
 
   renderer.setPixelRatio(1);
   renderer.setSize(W, H, false);
-  // aspect doesn't change (16:9 → 16:9), no need to update camera.aspect
   renderer.render(scene, camera);
   const url = renderer.domElement.toDataURL('image/png');
 
-  // restore
   renderer.setPixelRatio(origPR);
   renderer.setSize(orig.x, orig.y, false);
   tc.visible = wasVisible;
-  applyHighlight(heldSel);
+  heldHL.forEach(applyHighlight);
 
   const a = document.createElement('a');
   a.href = url;
@@ -415,19 +639,27 @@ document.getElementById('exportBtn').addEventListener('click', () => {
 
 window.addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement) return;
+
+  // Ctrl/Cmd + Z: undo
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+    e.preventDefault();
+    performUndo();
+    return;
+  }
+
   if (e.key === 'g' || e.key === 'G') setMode('translate');
   else if (e.key === 'r' || e.key === 'R') setMode('rotate');
   else if (e.key === 's' || e.key === 'S') setMode('scale');
   else if (e.key === 'Delete' || e.key === 'Backspace') {
     document.getElementById('deleteBtn').click();
   } else if (e.key === 'Escape') {
-    setSelected(null);
+    clearSelection();
   }
 });
 
-// --- Resize: fit a 16:9 box inside #stage ---
+// --- Resize ---
 function resize() {
-  const padding = 24; // matches #stage padding (12 each side)
+  const padding = 24;
   const sw = stage.clientWidth - padding;
   const sh = stage.clientHeight - padding;
   let w = sw, h = sw / ASPECT;
@@ -436,17 +668,16 @@ function resize() {
   viewport.style.width = w + 'px';
   viewport.style.height = h + 'px';
   renderer.setSize(w, h, false);
-  // camera aspect is fixed at 16/9
 }
 window.addEventListener('resize', resize);
 resize();
 
 // --- Initial scene ---
 addObject(makeMannequin());
+undoStack.length = 0; // don't allow undoing the initial figure
 setMode('translate');
 setCameraPreset('threeQ');
 
-// --- Loop ---
 function tick() {
   orbit.update();
   renderer.render(scene, camera);
